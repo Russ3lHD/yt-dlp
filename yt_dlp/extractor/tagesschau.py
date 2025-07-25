@@ -117,35 +117,78 @@ class TagesschauIE(InfoExtractor):
             webpage, 'title', default=None) or self._og_search_title(webpage, fatal=False)
 
         entries = []
-        videos = re.findall(r'<div[^>]+>', webpage)
-        num = 0
-        for video in videos:
-            video = extract_attributes(video).get('data-config')
-            if not video:
-                continue
-            video = self._parse_json(video, video_id, transform_source=js_to_json, fatal=False)
-            video_formats = try_get(video, lambda x: x['mc']['_mediaArray'][0]['_mediaStreamArray'])
-            if not video_formats:
-                continue
-            num += 1
-            for video_format in video_formats:
-                media_url = video_format.get('_stream') or ''
-                formats = []
+        # Try to extract direct media links from <source> or <video> tags
+        media_urls = re.findall(r'<source[^>]+src=["\']([^"\'>]+)', webpage)
+        if not media_urls:
+            # Try <video src="...">
+            media_urls = re.findall(r'<video[^>]+src=["\']([^"\'>]+)', webpage)
+
+        # Try <div class="mediaplayer" data-src="..."> or data-media
+        if not media_urls:
+            media_urls = re.findall(r'<div[^>]*class=["\']mediaplayer["\'][^>]*data-(?:src|media)=["\']([^"\'>]+)', webpage)
+
+        # Try to find embedded JSON with media URLs
+        if not media_urls:
+            json_matches = re.findall(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', webpage, re.DOTALL)
+            for json_str in json_matches:
+                try:
+                    import json
+                    data = json.loads(json_str)
+                    if isinstance(data, dict):
+                        video_url = data.get('contentUrl') or data.get('url')
+                        if video_url:
+                            media_urls.append(video_url)
+                except Exception:
+                    pass
+
+        if media_urls:
+            formats = []
+            for media_url in media_urls:
                 if media_url.endswith('master.m3u8'):
-                    formats = self._extract_m3u8_formats(media_url, video_id, 'mp4', m3u8_id='hls')
+                    formats.extend(self._extract_m3u8_formats(media_url, video_id, 'mp4', m3u8_id='hls'))a
                 elif media_url.endswith('.mp3'):
-                    formats = [{
-                        'url': media_url,
-                        'vcodec': 'none',
-                    }]
-                if not formats:
-                    continue
+                    formats.append({'url': media_url, 'vcodec': 'none'})
+                else:
+                    formats.append({'url': media_url})
+            if formats:
                 entries.append({
-                    'id': f'{display_id}-{num}',
-                    'title': try_get(video, lambda x: x['mc']['_title']),
-                    'duration': int_or_none(try_get(video, lambda x: x['mc']['_duration'])),
+                    'id': f'{display_id}-1',
+                    'title': title,
                     'formats': formats,
+                    'duration': None,
                 })
+
+        # Fallback to old method if no direct media links found
+        if not entries:
+            videos = re.findall(r'<div[^>]+>', webpage)
+            num = 0
+            for video in videos:
+                video = extract_attributes(video).get('data-config')
+                if not video:
+                    continue
+                video = self._parse_json(video, video_id, transform_source=js_to_json, fatal=False)
+                video_formats = try_get(video, lambda x: x['mc']['_mediaArray'][0]['_mediaStreamArray'])
+                if not video_formats:
+                    continue
+                num += 1
+                for video_format in video_formats:
+                    media_url = video_format.get('_stream') or ''
+                    formats = []
+                    if media_url.endswith('master.m3u8'):
+                        formats = self._extract_m3u8_formats(media_url, video_id, 'mp4', m3u8_id='hls')
+                    elif media_url.endswith('.mp3'):
+                        formats = [{
+                            'url': media_url,
+                            'vcodec': 'none',
+                        }]
+                    if not formats:
+                        continue
+                    entries.append({
+                        'id': f'{display_id}-{num}',
+                        'title': try_get(video, lambda x: x['mc']['_title']),
+                        'duration': int_or_none(try_get(video, lambda x: x['mc']['_duration'])),
+                        'formats': formats,
+                    })
 
         if not entries:
             raise UnsupportedError(url)
@@ -160,5 +203,5 @@ class TagesschauIE(InfoExtractor):
             'formats': entries[0]['formats'],
             'timestamp': parse_iso8601(self._html_search_meta('date', webpage)),
             'description': self._og_search_description(webpage),
-            'duration': entries[0]['duration'],
+            'duration': entries[0].get('duration'),
         }
