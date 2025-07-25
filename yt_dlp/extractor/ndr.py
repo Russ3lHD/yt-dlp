@@ -112,45 +112,73 @@ class NDRIE(NDRBaseIE):
     }]
 
     def _extract_embed(self, webpage, display_id, url):
-        embed_url = (
-            self._html_search_meta(
-                'embedURL', webpage, 'embed URL',
-                default=None)
-            or self._search_regex(
-                r'\bembedUrl["\']\s*:\s*(["\'])(?P<url>(?:(?!\1).)+)\1', webpage,
-                'embed URL', group='url', default=None)
-            or self._search_regex(
-                r'\bvar\s*sophoraID\s*=\s*(["\'])(?P<url>(?:(?!\1).)+)\1', webpage,
-                'embed URL', group='url', default=''))
-        # some more work needed if we only found sophoraID
-        if re.match(r'^[a-z]+\d+$', embed_url):
-            # get the initial part of the url path,. eg /panorama/archiv/2022/
-            parsed_url = urllib.parse.urlparse(url)
-            path = self._search_regex(rf'(.+/){display_id}', parsed_url.path or '', 'embed URL', default='')
-            # find tell-tale image with the actual ID
-            ndr_id = self._search_regex(rf'{path}([a-z]+\d+)(?!\.)\b', webpage, 'embed URL', default=None)
-            # or try to use special knowledge!
-            NDR_INFO_URL_TPL = 'https://www.ndr.de/info/%s-player.html'
-            embed_url = f'ndr:{ndr_id}' if ndr_id else NDR_INFO_URL_TPL % (embed_url, )
-        if not embed_url:
-            raise ExtractorError('Unable to extract embedUrl')
+        # Try to find the Heroelement's herocontainer data-config JSON
+        data_config = self._search_regex(
+            r'data-config="([^"]+)",?', webpage, 'data-config', default=None)
+        if not data_config:
+            raise ExtractorError('Unable to find data-config attribute for video extraction')
 
-        description = self._search_regex(
-            r'<p[^>]+itemprop="description">([^<]+)</p>',
-            webpage, 'description', default=None) or self._og_search_description(webpage)
-        timestamp = parse_iso8601(
-            self._search_regex(
-                (r'<span[^>]+itemprop="(?:datePublished|uploadDate)"[^>]+content="(?P<cont>[^"]+)"',
-                 r'\bvar\s*pdt\s*=\s*(?P<q>["\'])(?P<cont>(?:(?!(?P=q)).)+)(?P=q)'),
-                webpage, 'upload date', group='cont', default=None))
-        info = self._search_json_ld(webpage, display_id, default={})
-        return merge_dicts({
-            '_type': 'url_transparent',
-            'url': embed_url,
-            'display_id': display_id,
+        # Decode HTML entities
+        import html
+        data_config_json = html.unescape(data_config)
+
+        # Parse JSON
+        import json
+        try:
+            config = json.loads(data_config_json)
+        except Exception as e:
+            raise ExtractorError(f'Failed to parse data-config JSON: {e}')
+
+        # Extract video URLs from mc.streams[].media[].url
+        formats = []
+        streams = try_get(config, lambda x: x['mc']['streams'], list) or []
+        for stream in streams:
+            medias = stream.get('media', [])
+            for media in medias:
+                url_ = media.get('url')
+                mime = media.get('mimeType')
+                if not url_:
+                    continue
+                ext = determine_ext(url_, None)
+                f = {
+                    'url': url_,
+                    'format_id': ext,
+                    'ext': ext,
+                    'vcodec': None if mime and mime.startswith('audio/') else 'unknown',
+                }
+                formats.append(f)
+
+        # Extract subtitles
+        subtitles = {}
+        subs = try_get(config, lambda x: x['mc']['subtitles'], list) or []
+        for sub in subs:
+            lang = sub.get('languageCode', 'de')
+            for source in sub.get('sources', []):
+                sub_url = source.get('url')
+                if sub_url:
+                    subtitles.setdefault(lang, []).append({
+                        'url': sub_url,
+                        'ext': 'ttml',
+                    })
+
+        # Extract metadata
+        meta = try_get(config, lambda x: x['mc']['meta'], dict) or {}
+        title = meta.get('title') or display_id.replace('-', ' ').strip()
+        description = meta.get('synopsis') or self._og_search_description(webpage)
+        duration = int_or_none(meta.get('durationSeconds'))
+        timestamp = parse_iso8601(meta.get('broadcastedOnDateTime'))
+        uploader = try_get(config, lambda x: x['pluginData']['sharing@web']['services'], list)
+
+        return {
+            'id': display_id,
+            'title': title,
             'description': description,
+            'duration': duration,
             'timestamp': timestamp,
-        }, info)
+            'formats': formats,
+            'subtitles': subtitles,
+            'uploader': 'NDR',
+        }
 
 
 class NJoyIE(NDRBaseIE):
