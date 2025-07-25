@@ -8,14 +8,13 @@ from ..utils import (
 class TwentyMinutenIE(InfoExtractor):
     IE_NAME = '20min'
     _VALID_URL = r'''(?x)
-                    https?://
-                        (?:www\.)?20min\.ch/
-                        (?:
-                            videotv/*\?.*?\bvid=|
-                            videoplayer/videoplayer\.html\?.*?\bvideoId@
-                        )
-                        (?P<id>\d+)
-                    '''
+        https?://(?:www\.)?20min\.ch/
+        (?:
+            videotv/?\?.*?\bvid=(?P<id1>\d+)
+            |videoplayer/videoplayer\.html\?.*?\bvideoId@(?P<id2>\d+)
+            |story/[^/?#]+-(?P<id3>\d+)
+        )
+    '''
     _EMBED_REGEX = [r'<iframe[^>]+src=(["\'])(?P<url>(?:(?:https?:)?//)?(?:www\.)?20min\.ch/videoplayer/videoplayer.html\?.*?\bvideoId@\d+.*?)\1']
     _TESTS = [{
         'url': 'http://www.20min.ch/videotv/?vid=469148&cid=2',
@@ -44,37 +43,46 @@ class TwentyMinutenIE(InfoExtractor):
     }]
 
     def _real_extract(self, url):
-        video_id = self._match_id(url)
+        mobj = self._match_valid_url(url)
+        video_id = mobj.group('id1') or mobj.group('id2') or mobj.group('id3')
+        webpage = self._download_webpage(url, video_id)
 
-        video = self._download_json(
-            f'http://api.20min.ch/video/{video_id}/show',
-            video_id)['content']
+        # Try to find iframe with video player
+        iframe_url = self._search_regex(
+            r'<iframe[^>]+src=["\']([^"\']*videoplayer\.html[^"\']+)["\']',
+            webpage, 'iframe video player', default=None)
+        video_url = None
+        if iframe_url:
+            # Download the iframe page and extract video src
+            iframe_webpage = self._download_webpage(iframe_url, video_id, note='Downloading iframe player')
+            video_url = self._search_regex(
+                r'<video[^>]+src=["\']([^"\']+)["\']', iframe_webpage, 'video url', default=None)
 
-        title = video['title']
+        if not video_url:
+            # Fallback: try to find video src in main page
+            video_url = self._search_regex(
+                r'<video[^>]+src=["\']([^"\']+)["\']', webpage, 'video url', default=None)
+
+
+        if not video_url:
+            # Fallback: look for url_high in JSON
+            video_url = self._search_regex(
+                r'"url_high"\s*:\s*"(https?://[^"]+)"', webpage, 'high quality video url', default=None)
+
+        if not video_url:
+            raise self.raise_no_formats('Unable to extract video url')
+
+        title = self._og_search_title(webpage, default=video_id)
 
         formats = [{
-            'format_id': format_id,
-            'url': f'http://podcast.20min-tv.ch/podcast/20min/{video_id}{p}.mp4',
-            'quality': quality,
-        } for quality, (format_id, p) in enumerate([('sd', ''), ('hd', 'h')])]
-
-        description = video.get('lead')
-        thumbnail = video.get('thumbnail')
-
-        def extract_count(kind):
-            return try_get(
-                video,
-                lambda x: int_or_none(x['communityobject'][f'thumbs_{kind}']))
-
-        like_count = extract_count('up')
-        dislike_count = extract_count('down')
+            'url': video_url,
+            'ext': 'mp4',
+            'format_id': 'http',
+        }]
 
         return {
             'id': video_id,
             'title': title,
-            'description': description,
-            'thumbnail': thumbnail,
-            'like_count': like_count,
-            'dislike_count': dislike_count,
             'formats': formats,
         }
+
